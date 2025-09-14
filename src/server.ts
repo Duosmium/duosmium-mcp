@@ -217,24 +217,24 @@ class DuosmiumMCPServer {
           },
           {
             name: 'search',
-            description: 'Search for tournaments and teams across the duosmium dataset',
+            description: 'Search tournaments and schools from duosmium.org remote data sources',
             inputSchema: {
               type: 'object',
               properties: {
                 query: {
                   type: 'string',
-                  description: 'Search query (e.g., team name, school, location, tournament name)',
+                  description: 'Search query (e.g., tournament name, school name, location)',
                 },
                 type: {
                   type: 'string',
-                  enum: ['tournament', 'team', 'both'],
-                  description: 'Type of search: tournament, team, or both',
-                  default: 'both',
+                  enum: ['tournament', 'school', 'all'],
+                  description: 'Type of search: tournament, school, or all (default: all)',
+                  default: 'all',
                 },
                 limit: {
                   type: 'number',
-                  description: 'Maximum number of results to return (default: 10)',
-                  default: 10,
+                  description: 'Maximum number of results to return (default: 20)',
+                  default: 20,
                 },
               },
               required: ['query'],
@@ -601,127 +601,149 @@ class DuosmiumMCPServer {
       }
 
       if (name === 'search') {
-        const { query, type = 'both', limit = 10 } = args as {
+        const { query, type = 'all', limit = 20 } = args as {
           query: string;
-          type?: 'tournament' | 'team' | 'both';
+          type?: 'tournament' | 'school' | 'all';
           limit?: number;
         };
 
         try {
-          const allTournaments: { type: 'tournament'; id: string; name: string; details?: string; searchableText: string }[] = [];
-          const allTeams: { type: 'team'; id: string; name: string; details?: string; searchableText: string }[] = [];
+          // Normalize query - treat "team" as "school"
+          const normalizedQuery = query.toLowerCase().replace(/\bteam\b/g, 'school');
           
-          // Collect all tournaments and teams for fuzzy search
-          const tournaments = await this.getAvailableTournaments();
+          // Fetch both remote data sources
+          const [tournamentsResponse, schoolsResponse] = await Promise.all([
+            fetch('https://duosmium.org/results/tournaments.json'),
+            fetch('https://duosmium.org/results/schools.csv')
+          ]);
           
-          for (const tournamentId of tournaments) {
-            try {
-              const interpreter = await loadInterpreter(tournamentId);
-              const tournamentName = interpreter.tournament.name || tournamentId;
+          if (!tournamentsResponse.ok) {
+            throw new Error(`Failed to fetch tournaments: ${tournamentsResponse.status}`);
+          }
+          
+          if (!schoolsResponse.ok) {
+            throw new Error(`Failed to fetch schools: ${schoolsResponse.status}`);
+          }
+          
+          const tournaments = await tournamentsResponse.json();
+          const schoolsCsvText = await schoolsResponse.text();
+          
+          // Build search data arrays
+          const searchData: Array<{
+            type: 'tournament' | 'school';
+            name: string;
+            id: string;
+            details: string;
+            searchText: string;
+            metadata?: any;
+          }> = [];
+          
+          // Process tournaments data
+          if (type === 'tournament' || type === 'all') {
+            tournaments.forEach((tournament: any) => {
+              const name = tournament.title || tournament.filename || 'Unknown Tournament';
+              const location = tournament.location || '';
+              const division = tournament.division || '';
+              const year = tournament.year || '';
+              const official = tournament.official ? 'Official' : 'Unofficial';
+              const keywords = tournament.keywords || '';
               
-              // Add tournament to search collection
-              if (type === 'tournament' || type === 'both') {
-                allTournaments.push({
-                  type: 'tournament',
-                  id: tournamentId,
-                  name: tournamentName,
-                  details: `${interpreter.teams.length} teams, ${interpreter.events.length} events`,
-                  searchableText: `${tournamentName} ${tournamentId}`.toLowerCase()
+              searchData.push({
+                type: 'tournament',
+                name,
+                id: tournament.filename,
+                details: `${division} Division • ${year} • ${location} • ${official}`,
+                searchText: `${name} ${location} ${division} ${year} ${tournament.filename} ${keywords}`.toLowerCase(),
+                metadata: {
+                  bgColor: tournament.bgColor,
+                  teamCount: tournament.teamCount,
+                  date: tournament.date,
+                  logo: tournament.logo,
+                  events: tournament.events,
+                  keywords
+                }
+              });
+            });
+          }
+          
+          // Process schools CSV data
+          if (type === 'school' || type === 'all') {
+            const schoolLines = schoolsCsvText.split('\n').filter(line => line.trim());
+            
+            schoolLines.forEach((line, index) => {
+              const parts = line.split(',').map(part => part.replace(/^"(.*)"$/, '$1').trim());
+              const schoolName = parts[0];
+              const city = parts[1] || '';
+              const state = parts[2] || '';
+              
+              if (schoolName) {
+                const locationParts = [city, state].filter(Boolean);
+                const locationStr = locationParts.join(', ');
+                
+                searchData.push({
+                  type: 'school',
+                  name: schoolName,
+                  id: `school-${index}`,
+                  details: locationStr || 'Location not specified',
+                  searchText: `${schoolName} ${city} ${state} team`.toLowerCase(),
+                  metadata: { city, state }
                 });
               }
-              
-              // Add teams to search collection
-              if (type === 'team' || type === 'both') {
-                for (const team of interpreter.teams) {
-                  const teamName = team.school || '';
-                  const location = team.location || '';
-                  
-                  const teamDetails = [
-                    `#${team.number}`,
-                    location && `(${location})`,
-                    `Rank: ${team.rank}`,
-                    `in ${tournamentName}`
-                  ].filter(Boolean).join(' ');
-                  
-                  allTeams.push({
-                    type: 'team',
-                    id: `${tournamentId}:${team.number}`,
-                    name: teamName,
-                    details: teamDetails,
-                    searchableText: `${teamName} ${location} ${team.number} ${tournamentName}`.toLowerCase()
-                  });
-                }
-              }
-            } catch (error) {
-              // Skip tournaments that fail to load
-              continue;
-            }
+            });
           }
           
-          const results: { type: 'tournament' | 'team'; id: string; name: string; details?: string; score?: number }[] = [];
-          
-          // Configure Fuse.js for fuzzy search
-          const fuseOptions = {
-            keys: ['searchableText', 'name'],
-            threshold: 0.4, // Lower = more strict, Higher = more fuzzy
-            distance: 100,
+          // Perform fuzzy search using Fuse.js
+          const fuse = new Fuse(searchData, {
+            keys: [
+              { name: 'name', weight: 0.7 },
+              { name: 'searchText', weight: 0.3 }
+            ],
+            threshold: 0.3,
+            distance: 200,
             includeScore: true,
-            ignoreLocation: true,
-            findAllMatches: true,
-          };
+            ignoreLocation: true
+          });
           
-          // Search tournaments
-          if (allTournaments.length > 0) {
-            const tournamentFuse = new Fuse(allTournaments, fuseOptions);
-            const tournamentResults = tournamentFuse.search(query);
-            results.push(...tournamentResults.map(result => ({
-              ...result.item,
-              score: result.score
-            })));
-          }
+          const searchResults = fuse.search(normalizedQuery).slice(0, limit);
           
-          // Search teams
-          if (allTeams.length > 0) {
-            const teamFuse = new Fuse(allTeams, fuseOptions);
-            const teamResults = teamFuse.search(query);
-            results.push(...teamResults.map(result => ({
-              ...result.item,
-              score: result.score
-            })));
-          }
-          
-          // Sort by fuzzy search score (lower is better) and limit results
-          const sortedResults = results
-            .sort((a, b) => (a.score || 0) - (b.score || 0))
-            .slice(0, limit);
-
-          if (sortedResults.length === 0) {
+          if (searchResults.length === 0) {
+            const searchTypeText = type === 'all' ? 'tournaments or schools' : `${type}s`;
             return {
-              content: [
-                {
-                  type: 'text',
-                  text: `No ${type === 'both' ? 'tournaments or teams' : type + 's'} found matching "${query}"`,
-                },
-              ],
+              content: [{
+                type: 'text',
+                text: `No ${searchTypeText} found matching "${query}"`
+              }]
             };
           }
-
-          const resultsText = sortedResults.map(result => {
-            return `${result.type.toUpperCase()}: ${result.id}`;
+          
+          // Format results
+          const formattedResults = searchResults.map(result => {
+            const item = result.item;
+            const score = result.score ? ` (${(result.score * 100).toFixed(1)}% match)` : '';
+            return `${item.type.toUpperCase()}: ${item.name}\n  ${item.details}${score}\n  ID: ${item.id}`;
           }).join('\n\n');
-
+          
+          const summary = `Found ${searchResults.length} result${searchResults.length === 1 ? '' : 's'} for "${query}"`;
+          const typeBreakdown = searchResults.reduce((acc, result) => {
+            acc[result.item.type] = (acc[result.item.type] || 0) + 1;
+            return acc;
+          }, {} as Record<string, number>);
+          
+          const breakdown = Object.entries(typeBreakdown)
+            .map(([type, count]) => `${count} ${type}${count === 1 ? '' : 's'}`)
+            .join(', ');
+          
           return {
-            content: [
-              {
-                type: 'text',
-                text: `Search results for "${query}" (${sortedResults.length} found):\n\n${resultsText}`,
-              },
-            ],
+            content: [{
+              type: 'text',
+              text: `${summary} (${breakdown}):\n\n${formattedResults}`
+            }]
           };
+          
         } catch (error: any) {
           throw new McpError(
             ErrorCode.InternalError,
-            `Failed to search: ${error.message}`
+            `Search failed: ${error.message}`
           );
         }
       }
